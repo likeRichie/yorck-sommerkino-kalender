@@ -1,0 +1,36 @@
+name: Debug NextData Dump
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run debug dump
+        run: python debug_dump.py
+
+      - name: Show file size
+        run: ls -la debug_nextdata.json && wc -c debug_nextdata.json
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "sommerkino-bot"
+          git config user.email "actions@github.com"
+          git add debug_nextdata.json
+          git diff --staged --quiet || git commit -m "Debug: dump next data"
+          git push
