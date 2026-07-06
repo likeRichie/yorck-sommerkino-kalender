@@ -88,11 +88,10 @@ def parse_day(html: str, day: dt.date):
             href.startswith("/filme/")
             and text
             and not TIME_RE.match(text)
-            and a.find_parent(["h2", "h3", "h4"]) is not None
+            and text.strip().lower() != "mehr"
         ):
-            # Nur der echte Titel-Link (steht in einer Überschrift) zählt.
-            # Der "(Mehr)"-Link im Fließtext hat denselben href, aber
-            # keine Überschrift als Elternelement - wird hier ausgefiltert.
+            # Titel-Link. Der "(Mehr)"-Link im Fließtext hat denselben
+            # href, aber immer den Linktext "Mehr" - wird hier ausgefiltert.
             current_title = text
             current_href = "https://www.yorck.de" + href
             # Container etwas weiter oben im Baum, um Genre/Dauer/FSK
