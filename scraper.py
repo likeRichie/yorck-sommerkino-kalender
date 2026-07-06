@@ -1,119 +1,91 @@
 #!/usr/bin/env python3
 """
-Scraped das Tagesprogramm des ARTE Sommerkino Kulturforum (Yorck Kinos)
-und erzeugt daraus eine ICS-Datei zum Abonnieren (z.B. in iCloud).
+Liest den eingebetteten Next.js-Datenblock (__NEXT_DATA__) der Yorck-Seite
+für das ARTE Sommerkino Kulturforum aus und baut daraus eine ICS-Datei.
 
-Quelle: https://www.yorck.de/kinos/sommerkino-kulturforum?tab=daily&date=YYYY-MM-DD
+Jeder Film hat in der Saison genau eine (oder wenige) Vorstellung(en),
+gespeichert unter props.pageProps.filmsSpecials[*].fields.sessions.
+Einträge mit einem "type"-Feld (Filmreihe / Special Screening) sind
+Wrapper, die dieselbe Session-ID wie der zugehörige Film noch einmal
+referenzieren - werden übersprungen, um Dubletten zu vermeiden.
 """
 
 import re
 import sys
+import json
 import hashlib
 import datetime as dt
-from zoneinfo import ZoneInfo
 
 import requests
-from bs4 import BeautifulSoup
 
-BASE_URL = "https://www.yorck.de/kinos/sommerkino-kulturforum"
-TZ = ZoneInfo("Europe/Berlin")
-
-# Saisonzeitraum. Bei Bedarf anpassen (z.B. wenn Yorck die Saison verlängert).
-SEASON_START = dt.date(2026, 6, 17)
-SEASON_END = dt.date(2026, 8, 26)
-
-# Erkennt Zeit+Fassungs-Angaben wie "21:15OmU", "21:30DF", "21:45OmeU"
-TIME_RE = re.compile(r"^(\d{2}:\d{2})([A-Za-zÄÖÜäöüß]*)$")
-DURATION_RE = re.compile(r"(\d+)\s*min")
+URL = "https://www.yorck.de/kinos/sommerkino-kulturforum"
+CINEMA_NAME = "ARTE Sommerkino Kulturforum"
+DEFAULT_DURATION_MIN = 150
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; SommerkinoICSBot/1.0; +https://github.com/)"
 }
 
 
-def fetch_day(day: dt.date) -> str:
-    params = {
-        "tab": "daily",
-        "date": day.isoformat(),
-        "sort": "Popularity",
-        "sessionsExpanded": "false",
-    }
-    resp = requests.get(BASE_URL, params=params, headers=HEADERS, timeout=30)
+def fetch_next_data() -> dict:
+    resp = requests.get(URL, params={"tab": "daily"}, headers=HEADERS, timeout=30)
     resp.raise_for_status()
-    return resp.text
+    match = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        resp.text,
+        re.DOTALL,
+    )
+    if not match:
+        raise RuntimeError("__NEXT_DATA__-Block nicht gefunden - hat sich das Seitenlayout geändert?")
+    return json.loads(match.group(1))
 
 
-def parse_day(html: str, day: dt.date):
-    """
-    Läuft in Dokumentreihenfolge über alle <a>-Tags.
-    Ein Link auf /filme/<slug> mit sichtbarem Text (nicht leer, kein
-    Zeit-Muster) setzt den 'aktuellen' Filmtitel. Ein Link mit Text im
-    Format 'HH:MMVersion' erzeugt daraufhin einen Termin-Eintrag.
-    """
-    soup = BeautifulSoup(html, "html.parser")
+def extract_entries(data: dict):
+    films = data.get("props", {}).get("pageProps", {}).get("filmsSpecials", [])
     entries = []
-    current_title = None
-    current_href = None
-    current_container = None
 
-    for a in soup.find_all("a", href=True):
-        text = a.get_text(strip=True)
-        href = a["href"]
+    for film in films:
+        fields = film.get("fields", {})
 
-        time_match = TIME_RE.match(text)
-        if time_match and href == "#":
-            if current_title:
-                hh, mm = time_match.group(1).split(":")
-                version = time_match.group(2) or ""
+        # Wrapper-Einträge (Filmreihe / Special Screening) referenzieren
+        # dieselbe Session-ID wie der eigentliche Film erneut - überspringen,
+        # sonst gibt es Dubletten im Kalender.
+        if "type" in fields:
+            continue
 
-                duration_min = None
-                if current_container is not None:
-                    block_text = current_container.get_text(" ", strip=True)
-                    dur_match = DURATION_RE.search(block_text)
-                    if dur_match:
-                        duration_min = int(dur_match.group(1))
+        title = fields.get("title")
+        slug = fields.get("slug")
+        runtime = fields.get("runtime")
 
-                entries.append(
-                    {
-                        "date": day,
-                        "title": current_title,
-                        "hour": int(hh),
-                        "minute": int(mm),
-                        "version": version,
-                        "duration_min": duration_min,
-                        "url": current_href,
-                    }
-                )
-        elif (
-            href.startswith("/filme/")
-            and text
-            and not TIME_RE.match(text)
-            and text.strip().lower() != "mehr"
-        ):
-            # Titel-Link. Der "(Mehr)"-Link im Fließtext hat denselben
-            # href, aber immer den Linktext "Mehr" - wird hier ausgefiltert.
-            current_title = text
-            current_href = "https://www.yorck.de" + href
-            # Container etwas weiter oben im Baum, um Genre/Dauer/FSK
-            # desselben Film-Blocks mit einzufangen.
-            container = a
-            for _ in range(4):
-                if container.parent is not None:
-                    container = container.parent
-            current_container = container
+        for session in fields.get("sessions", []):
+            sfields = session.get("fields", {})
+            cinema_name = sfields.get("cinema", {}).get("fields", {}).get("name")
+            if cinema_name and cinema_name != CINEMA_NAME:
+                continue
+
+            start_raw = sfields.get("startTime")
+            if not title or not start_raw:
+                continue
+
+            start_dt = dt.datetime.fromisoformat(start_raw)
+            formats = sfields.get("formats") or []
+
+            entries.append(
+                {
+                    "title": title,
+                    "slug": slug,
+                    "runtime": runtime,
+                    "start": start_dt,
+                    "version": "/".join(formats),
+                    "session_id": session.get("sys", {}).get("id"),
+                }
+            )
 
     return entries
 
 
-def daterange(start: dt.date, end: dt.date):
-    day = start
-    while day <= end:
-        yield day
-        day += dt.timedelta(days=1)
-
-
 def make_uid(entry) -> str:
-    raw = f"{entry['date'].isoformat()}-{entry['hour']:02d}{entry['minute']:02d}-{entry['title']}"
+    raw = f"{entry.get('session_id') or entry['start'].isoformat()}-{entry['title']}"
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
     return f"{digest}@sommerkino-kulturforum"
 
@@ -125,19 +97,6 @@ def escape_ics_text(text: str) -> str:
         .replace(",", "\\,")
         .replace("\n", "\\n")
     )
-
-
-def fold_line(line: str) -> str:
-    """ICS-Zeilen dürfen laut RFC 5545 nicht länger als 75 Byte sein."""
-    if len(line.encode("utf-8")) <= 75:
-        return line
-    out = []
-    while len(line.encode("utf-8")) > 75:
-        # naive Trennung nach Zeichen statt Byte-genauer Prüfung reicht hier
-        out.append(line[:74])
-        line = " " + line[74:]
-    out.append(line)
-    return "\r\n".join(out)
 
 
 def build_ics(entries) -> str:
@@ -152,16 +111,10 @@ def build_ics(entries) -> str:
         "X-WR-TIMEZONE:Europe/Berlin",
     ]
 
-    for entry in entries:
-        start_local = dt.datetime(
-            entry["date"].year,
-            entry["date"].month,
-            entry["date"].day,
-            entry["hour"],
-            entry["minute"],
-            tzinfo=TZ,
-        )
-        duration_min = entry["duration_min"] or 150
+    # nach Startzeit sortieren, damit die ICS-Datei chronologisch ist
+    for entry in sorted(entries, key=lambda e: e["start"]):
+        start_local = entry["start"]
+        duration_min = entry["runtime"] or DEFAULT_DURATION_MIN
         end_local = start_local + dt.timedelta(minutes=duration_min)
 
         start_utc = start_local.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -176,10 +129,10 @@ def build_ics(entries) -> str:
         lines.append(f"DTSTAMP:{now_utc}")
         lines.append(f"DTSTART:{start_utc}")
         lines.append(f"DTEND:{end_utc}")
-        lines.append(fold_line(f"SUMMARY:{escape_ics_text(summary)}"))
+        lines.append(f"SUMMARY:{escape_ics_text(summary)}")
         lines.append("LOCATION:ARTE Sommerkino Kulturforum\\, Matthäikirchplatz\\, Berlin")
-        if entry["url"]:
-            lines.append(fold_line(f"URL:{entry['url']}"))
+        if entry.get("slug"):
+            lines.append(f"URL:https://www.yorck.de/filme/{entry['slug']}")
         lines.append("END:VEVENT")
 
     lines.append("END:VCALENDAR")
@@ -187,26 +140,10 @@ def build_ics(entries) -> str:
 
 
 def main():
-    today = dt.datetime.now(TZ).date()
-    start = max(SEASON_START, today)
-    end = SEASON_END
-
-    if start > end:
-        sys.stderr.write("Saison ist vorbei, keine Tage zu scrapen.\n")
-        print(build_ics([]))
-        return
-
-    all_entries = []
-    for day in daterange(start, end):
-        try:
-            html = fetch_day(day)
-            entries = parse_day(html, day)
-            all_entries.extend(entries)
-            sys.stderr.write(f"{day.isoformat()}: {len(entries)} Vorstellungen\n")
-        except Exception as exc:  # robust: ein Tag darf nicht alles blockieren
-            sys.stderr.write(f"{day.isoformat()}: Fehler beim Scrapen ({exc})\n")
-
-    ics = build_ics(all_entries)
+    data = fetch_next_data()
+    entries = extract_entries(data)
+    sys.stderr.write(f"{len(entries)} Vorstellungen gefunden\n")
+    ics = build_ics(entries)
     print(ics)
 
 
