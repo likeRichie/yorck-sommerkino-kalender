@@ -15,12 +15,14 @@ import sys
 import json
 import hashlib
 import datetime as dt
+from zoneinfo import ZoneInfo
 
 import requests
 
 URL = "https://www.yorck.de/kinos/sommerkino-kulturforum"
 CINEMA_NAME = "ARTE Sommerkino Kulturforum"
 DEFAULT_DURATION_MIN = 150
+BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; SommerkinoICSBot/1.0; +https://github.com/)"
@@ -68,6 +70,11 @@ def extract_entries(data: dict):
                 continue
 
             start_dt = dt.datetime.fromisoformat(start_raw)
+            # Die Website liefert den Offset fälschlich konstant als +01:00,
+            # auch während der Sommerzeit (+02:00 wäre korrekt). Wir nehmen
+            # daher nur die "Wanduhr"-Zeit und wenden die echte Berliner
+            # Zeitzone (inkl. korrekter Sommerzeit-Umstellung) an.
+            start_dt = start_dt.replace(tzinfo=None).replace(tzinfo=BERLIN_TZ)
             formats = sfields.get("formats") or []
 
             entries.append(
@@ -132,7 +139,9 @@ def build_ics(entries) -> str:
         lines.append(f"SUMMARY:{escape_ics_text(summary)}")
         lines.append("LOCATION:ARTE Sommerkino Kulturforum\\, Matthäikirchplatz\\, Berlin")
         if entry.get("slug"):
-            lines.append(f"URL:https://www.yorck.de/filme/{entry['slug']}")
+            film_url = f"https://www.yorck.de/filme/{entry['slug']}"
+            lines.append(f"URL:{film_url}")
+            lines.append(f"DESCRIPTION:{escape_ics_text(film_url)}")
         lines.append("END:VEVENT")
 
     lines.append("END:VCALENDAR")
